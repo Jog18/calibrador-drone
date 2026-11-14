@@ -1,9 +1,9 @@
 ## Interfaz 2 - Plataforma de pruebas multirrotor (ARMTOP)
 ## Basada en interface.py de Mario Aguilera Ruiz (CICESE 2024)
 ##
-## Protocolo serie (sin cambios, compatible con esp32_pc.ino):
-##   PC -> ESP32 : "arm,throttle,roll_d,pitch_d,P,I,D\n"
-##   ESP32 -> PC : "roll,pitch\n"
+## Protocolo serie (compatible con FIN_ESP_PC.ino / FIN_ESP_DRON.ino actualizados):
+##   PC -> ESP32 : "arm,throttle,roll_d,pitch_d,P,I,D,yaw_cmd\n"
+##   ESP32 -> PC : "roll,pitch,yaw\n"   (yaw opcional: con 2 valores sigue funcionando)
 ##
 ## Mejoras respecto a interface.py:
 ##   - Tema oscuro moderno y diseño organizado en paneles
@@ -17,12 +17,15 @@
 ##   - Registro CSV opcional, un archivo por sesión con nombre con fecha
 ##   - Envío periódico de comandos (keep-alive) y sin errores si no hay conexión
 ##   - Modo SIMULADOR para probar la interfaz sin hardware
+##   - Yaw: lectura en vivo, gráfica y comando de giro (yaw_cmd)
+##   - Reenvío de roll/pitch/yaw por UDP al visor 3D de la 2da PC
 
 import csv
 import os
 import math
 import queue
 import random
+import socket
 import threading
 import time
 import tkinter as tk
@@ -48,6 +51,11 @@ THROTTLE_MAX = 60
 ANGLE_MAX = 50
 PID_DEFAULTS = (22, 20, 30)
 PID_MAX = 200
+YAW_CMD_MAX = 50         # rango del comando de yaw (-50..50, como roll/pitch)
+
+# Envío de los ángulos a la 2da PC (visor 3D) por UDP. Pon "" para desactivar.
+PC2_IP = ""              # vacío = desactivado (el visor usa la 3ra ESP). Para UDP: IP de la 2da PC
+PC2_PORT = 5005
 
 COLORS = {
     "bg": "#1e1f26",
@@ -60,6 +68,7 @@ COLORS = {
     "danger": "#ff5555",
     "roll": "#4fc3f7",
     "pitch": "#ff79c6",
+    "yaw": "#bd93f9",
     "grid": "#3a3d4d",
 }
 
@@ -77,7 +86,7 @@ class SerialLink:
         self._running = False
         self._thread = None
         self._lock = threading.Lock()
-        self._sim_cmd = (0, 0, 0, 0)  # arm, thr, rolld, pitchd
+        self._sim_cmd = (0, 0, 0, 0, 0)  # arm, thr, rolld, pitchd, yawd
 
     @property
     def connected(self):
@@ -107,13 +116,13 @@ class SerialLink:
                 pass
             self.ser = None
 
-    def write(self, arm, thr, rolld, pitchd, p, i, d):
+    def write(self, arm, thr, rolld, pitchd, p, i, d, yawd=0):
         if not self._running:
             return False
         if self.simulated:
-            self._sim_cmd = (arm, thr, rolld, pitchd)
+            self._sim_cmd = (arm, thr, rolld, pitchd, yawd)
             return True
-        msg = f"{arm},{thr},{rolld},{pitchd},{p},{i},{d}\n"
+        msg = f"{arm},{thr},{rolld},{pitchd},{p},{i},{d},{yawd}\n"
         try:
             with self._lock:
                 self.ser.write(msg.encode())
@@ -141,22 +150,27 @@ class SerialLink:
                 roll, pitch = float(parts[0]), float(parts[1])
             except ValueError:
                 continue  # p.ej. "ESPNow Init Success"
-            self.rx_queue.put(("data", roll, pitch))
+            try:
+                yaw = float(parts[2]) if len(parts) > 2 else None
+            except ValueError:
+                yaw = None
+            self.rx_queue.put(("data", roll, pitch, yaw))
 
     def _sim_loop(self):
         """Simula un dron de primer orden que sigue la referencia."""
-        roll = pitch = 0.0
+        roll = pitch = yaw = 0.0
         t0 = time.time()
         while self._running:
-            arm, thr, rolld, pitchd = self._sim_cmd
+            arm, thr, rolld, pitchd, yawd = self._sim_cmd
             t = time.time() - t0
             if arm:
                 roll += 0.15 * (rolld - roll) + random.gauss(0, 0.6) + 0.8 * math.sin(3 * t)
                 pitch += 0.15 * (pitchd - pitch) + random.gauss(0, 0.6) + 0.8 * math.cos(2 * t)
+                yaw = (yaw + 0.035 * yawd + 180) % 360 - 180
             else:
                 roll *= 0.9
                 pitch *= 0.9
-            self.rx_queue.put(("data", round(roll), round(pitch)))
+            self.rx_queue.put(("data", round(roll), round(pitch), round(yaw)))
             time.sleep(0.07)
 
 
@@ -168,10 +182,11 @@ class App:
         self.root = root
         self.root.title("Plataforma de pruebas multirrotor — Interfaz 2")
         self.root.configure(bg=COLORS["bg"])
-        self.root.minsize(1100, 680)
+        self.root.minsize(1100, 760)
 
         self.rx_queue = queue.Queue()
         self.link = SerialLink(self.rx_queue)
+        self.udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM) if PC2_IP else None
 
         self.armed = False
         self.paused = False
@@ -186,6 +201,7 @@ class App:
         self.t_pitch = deque(maxlen=SAMPLES)
         self.t_rolld = deque(maxlen=SAMPLES)
         self.t_pitchd = deque(maxlen=SAMPLES)
+        self.t_yaw = deque(maxlen=SAMPLES)
 
         self._setup_style()
         self._build_layout()
@@ -299,9 +315,11 @@ class App:
         self.var_thr = tk.IntVar(value=0)
         self.var_roll = tk.IntVar(value=0)
         self.var_pitch = tk.IntVar(value=0)
+        self.var_yaw = tk.IntVar(value=0)
         self._slider(f, 2, "Throttle (%)", self.var_thr, 0, THROTTLE_MAX)
         self._slider(f, 4, "Roll ref (°)", self.var_roll, -ANGLE_MAX, ANGLE_MAX, center=True)
         self._slider(f, 6, "Pitch ref (°)", self.var_pitch, -ANGLE_MAX, ANGLE_MAX, center=True)
+        self._slider(f, 8, "Yaw cmd (giro)", self.var_yaw, -YAW_CMD_MAX, YAW_CMD_MAX, center=True)
 
     def _slider(self, parent, row, text, var, lo, hi, center=False):
         ttk.Label(parent, text=text, style="Panel.TLabel").grid(row=row, column=0, columnspan=2, sticky="w",
@@ -352,7 +370,7 @@ class App:
         f = ttk.Frame(parent, style="Panel.TFrame", padding=10)
         f.grid(row=0, column=0, sticky="ew", pady=(0, 10))
         self.readouts = {}
-        items = (("roll", "Roll", COLORS["roll"]), ("pitch", "Pitch", COLORS["pitch"]),
+        items = (("roll", "Roll", COLORS["roll"]), ("pitch", "Pitch", COLORS["pitch"]), ("yaw", "Yaw", COLORS["yaw"]),
                  ("eroll", "Error roll", COLORS["muted"]), ("epitch", "Error pitch", COLORS["muted"]))
         for i, (key, title, color) in enumerate(items):
             f.columnconfigure(i, weight=1)
@@ -372,9 +390,10 @@ class App:
     def _build_plot(self, parent):
         c = COLORS
         self.fig = Figure(figsize=(8, 4), dpi=100, facecolor=c["panel"])
-        self.ax_roll = self.fig.add_subplot(211)
-        self.ax_pitch = self.fig.add_subplot(212, sharex=self.ax_roll)
-        for ax, title in ((self.ax_roll, "Roll"), (self.ax_pitch, "Pitch")):
+        self.ax_roll = self.fig.add_subplot(311)
+        self.ax_pitch = self.fig.add_subplot(312, sharex=self.ax_roll)
+        self.ax_yaw = self.fig.add_subplot(313, sharex=self.ax_roll)
+        for ax, title in ((self.ax_roll, "Roll"), (self.ax_pitch, "Pitch"), (self.ax_yaw, "Yaw")):
             ax.set_facecolor(c["bg"])
             ax.set_xlim(0, SAMPLES)
             ax.set_ylim(-60, 60)
@@ -383,13 +402,15 @@ class App:
             ax.grid(True, color=c["grid"], linewidth=0.6)
             for sp in ax.spines.values():
                 sp.set_color(c["grid"])
-        self.ax_pitch.set_xlabel("Muestras", color=c["fg"])
+        self.ax_yaw.set_ylim(-190, 190)
+        self.ax_yaw.set_xlabel("Muestras", color=c["fg"])
 
         self.l_roll, = self.ax_roll.plot([], [], lw=2, color=c["roll"], label="Roll")
         self.l_rolld, = self.ax_roll.plot([], [], lw=1.5, ls="--", color=c["warn"], label="Roll ref")
         self.l_pitch, = self.ax_pitch.plot([], [], lw=2, color=c["pitch"], label="Pitch")
         self.l_pitchd, = self.ax_pitch.plot([], [], lw=1.5, ls="--", color=c["warn"], label="Pitch ref")
-        for ax in (self.ax_roll, self.ax_pitch):
+        self.l_yaw, = self.ax_yaw.plot([], [], lw=2, color=c["yaw"], label="Yaw")
+        for ax in (self.ax_roll, self.ax_pitch, self.ax_yaw):
             leg = ax.legend(loc="upper left", facecolor=c["panel"], edgecolor=c["grid"], fontsize=8)
             for t in leg.get_texts():
                 t.set_color(c["fg"])
@@ -463,7 +484,8 @@ class App:
         p = max(0, min(PID_MAX, safe(self.var_p, PID_DEFAULTS[0])))
         i = max(0, min(PID_MAX, safe(self.var_i, PID_DEFAULTS[1])))
         d = max(0, min(PID_MAX, safe(self.var_d, PID_DEFAULTS[2])))
-        return (1 if self.armed else 0, safe(self.var_thr), safe(self.var_roll), safe(self.var_pitch), p, i, d)
+        return (1 if self.armed else 0, safe(self.var_thr), safe(self.var_roll), safe(self.var_pitch), p, i, d,
+                max(-YAW_CMD_MAX, min(YAW_CMD_MAX, safe(self.var_yaw))))
 
     def send_values(self):
         self.link.write(*self.current_command())
@@ -493,6 +515,7 @@ class App:
         self.var_thr.set(0)
         self.var_roll.set(0)
         self.var_pitch.set(0)
+        self.var_yaw.set(0)
         self.btn_arm.config(text="ARMAR", style="Arm.TButton")
         self.send_values()
         self.set_status(msg)
@@ -508,7 +531,7 @@ class App:
         self.btn_pause.config(text="▶ Reanudar" if self.paused else "⏸ Pausar")
 
     def clear_plot(self):
-        for dq in (self.t_roll, self.t_pitch, self.t_rolld, self.t_pitchd):
+        for dq in (self.t_roll, self.t_pitch, self.t_rolld, self.t_pitchd, self.t_yaw):
             dq.clear()
         self._redraw()
 
@@ -537,7 +560,7 @@ class App:
             messagebox.showerror("Error", f"No se pudo crear el archivo:\n{e}")
             return
         self.csv_writer = csv.writer(self.csv_file)
-        self.csv_writer.writerow(["time", "roll", "pitch", "rolld", "pitchd", "arm", "throttle", "P", "I", "D"])
+        self.csv_writer.writerow(["time", "roll", "pitch", "rolld", "pitchd", "arm", "throttle", "P", "I", "D", "yaw", "yawd"])
         self.lbl_log.config(text=f"Guardando: {os.path.basename(name)}")
         self.set_status("Registro CSV iniciado")
 
@@ -559,8 +582,8 @@ class App:
             if item[0] == "error":
                 self.disconnect(f"Error de comunicación: {item[1]}")
                 continue
-            _, roll, pitch = item
-            arm, thr, rolld, pitchd, p, i, d = self.current_command()
+            _, roll, pitch, yaw = item
+            arm, thr, rolld, pitchd, p, i, d, yawd = self.current_command()
             self.rx_count += 1
             got_data = True
             if not self.paused:
@@ -568,17 +591,25 @@ class App:
                 self.t_pitch.append(pitch)
                 self.t_rolld.append(rolld)
                 self.t_pitchd.append(pitchd)
+                self.t_yaw.append(yaw if yaw is not None else float("nan"))
             if self.csv_writer:
                 ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-                self.csv_writer.writerow([ts, roll, pitch, rolld, pitchd, arm, thr, p, i, d])
-            self._update_readouts(roll, pitch, rolld, pitchd)
+                self.csv_writer.writerow([ts, roll, pitch, rolld, pitchd, arm, thr, p, i, d, yaw, yawd])
+            self._update_readouts(roll, pitch, yaw, rolld, pitchd)
+            if self.udp:  # reenvío al visor 3D de la 2da PC
+                msg = f"{roll},{pitch}" + (f",{yaw}" if yaw is not None else "")
+                try:
+                    self.udp.sendto(msg.encode(), (PC2_IP, PC2_PORT))
+                except OSError:
+                    pass
         if got_data and not self.paused:
             self._redraw()
         self.root.after(PLOT_PERIOD_MS, self._poll)
 
-    def _update_readouts(self, roll, pitch, rolld, pitchd):
+    def _update_readouts(self, roll, pitch, yaw, rolld, pitchd):
         self.readouts["roll"].config(text=f"{roll:+.0f}°")
         self.readouts["pitch"].config(text=f"{pitch:+.0f}°")
+        self.readouts["yaw"].config(text="—" if yaw is None else f"{yaw:+.0f}°")
         for key, err in (("eroll", rolld - roll), ("epitch", pitchd - pitch)):
             color = COLORS["ok"] if abs(err) < 3 else COLORS["warn"] if abs(err) < 10 else COLORS["danger"]
             self.readouts[key].config(text=f"{err:+.0f}°", foreground=color)
@@ -589,6 +620,7 @@ class App:
         self.l_rolld.set_data(x, self.t_rolld)
         self.l_pitch.set_data(x, self.t_pitch)
         self.l_pitchd.set_data(x, self.t_pitchd)
+        self.l_yaw.set_data(x, self.t_yaw)
         self.canvas.draw_idle()
 
     def _keepalive(self):
